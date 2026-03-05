@@ -65,10 +65,12 @@ class GravNetBlock(nn.Module):
         ):
         super(GravNetBlock, self).__init__()
         # Includes all layers up to the global_exchange
-        self.gravnet_layer = GravNetConv(
-                in_channels, out_channels,
-                space_dimensions, propagate_dimensions, k
-                ).jittable()
+        # self.gravnet_layer = GravNetConv(
+        #         in_channels, out_channels,
+        #         space_dimensions, propagate_dimensions, k
+        #         ).jittable()
+        #jittable is not compatible with GravNetOp use
+        self.gravnet_layer = torch.jit.script(GravNetConv(in_channels, out_channels, space_dimensions, propagate_dimensions, k))
         self.post_gravnet = nn.Sequential(
             nn.BatchNorm1d(out_channels),
             nn.Linear(out_channels, 128),
@@ -127,7 +129,7 @@ class GravnetModel(nn.Module):
         postgn_dense_modules = nn.ModuleList()
         for i in range(self.n_postgn_dense_blocks):
             postgn_dense_modules.extend([
-                nn.Linear(4*96 if i==0 else 128, 128),
+                nn.Linear(self.n_gravnet_blocks*96 if i==0 else 128, 128),
                 nn.ReLU(),
                 nn.BatchNorm1d(128),
                 ])
@@ -155,7 +157,7 @@ class GravnetModel(nn.Module):
             x = gravnet_block(x, batch)
             x_gravnet_per_block.append(x)
         x = torch.cat(x_gravnet_per_block, dim=-1)
-        assert x.size() == (x.size(0), 4*96)
+        assert x.size() == (x.size(0), self.n_gravnet_blocks*96)
         assert x.device == device
 
         x = self.postgn_dense(x)
@@ -183,7 +185,7 @@ class NoiseFilterModel(nn.Module):
             nn.Linear(32, 16),
             nn.ReLU(),
             nn.Linear(16, 2),
-            nn.LogSoftmax()
+            nn.LogSoftmax(dim=-1)
             )
 
     def forward(self, x: Tensor) -> Tensor:
