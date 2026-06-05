@@ -5,6 +5,7 @@ from torch_scatter import scatter_min, scatter_max, scatter_mean
 
 from torch_cmspepr import GravNetConv
 from torch_cmspepr.objectcondensation import scatter_count
+from torch.utils.checkpoint import checkpoint
 
 from typing import Tuple, Union, List
 
@@ -61,7 +62,8 @@ class GravNetBlock(nn.Module):
     def __init__(
         self,
         in_channels: int, out_channels: int = 96,
-        space_dimensions: int = 4, propagate_dimensions: int = 22, k: int = 40
+        space_dimensions: int = 4, propagate_dimensions: int = 22, k: int = 40,
+        use_checkpoint: bool = False #gradient checkpoint effort
         ):
         super(GravNetBlock, self).__init__()
         # Includes all layers up to the global_exchange
@@ -70,7 +72,8 @@ class GravNetBlock(nn.Module):
         #         space_dimensions, propagate_dimensions, k
         #         ).jittable()
         #jittable is not compatible with GravNetOp use
-        self.gravnet_layer = torch.jit.script(GravNetConv(in_channels, out_channels, space_dimensions, propagate_dimensions, k))
+        self.gravnet_layer = GravNetConv(in_channels, out_channels, space_dimensions, propagate_dimensions, k)
+        # self.gravnet_layer = torch.jit.script(GravNetConv(in_channels, out_channels, space_dimensions, propagate_dimensions, k))
         self.post_gravnet = nn.Sequential(
             nn.BatchNorm1d(out_channels),
             nn.Linear(out_channels, 128),
@@ -84,9 +87,15 @@ class GravNetBlock(nn.Module):
             nn.Tanh(),
             nn.BatchNorm1d(96)
             )
+        self.use_checkpoint = use_checkpoint #gradient checkpoint effort
 
     def forward(self, x: Tensor, batch: Tensor) -> Tensor:
-        x = self.gravnet_layer(x, batch)
+        if self.training and self.use_checkpoint:
+            def run_gravnet(x_in):
+                return self.gravnet_layer(x_in, batch)
+            x=checkpoint(run_gravnet, x, use_reentrant=False, preserve_rng_state=False)
+        else:
+            x = self.gravnet_layer(x, batch)
         x = self.post_gravnet(x)
         assert x.size(1) == 96
         x = global_exchange(x, batch)
@@ -104,6 +113,7 @@ class GravnetModel(nn.Module):
         n_gravnet_blocks: int=4,
         n_postgn_dense_blocks: int=4,
         k: Union[List[int], int] = 40,
+        use_checkpoint: bool = False #gradient checkpoint effort
         ):
         super(GravnetModel, self).__init__()
         self.input_dim = input_dim
@@ -121,9 +131,16 @@ class GravnetModel(nn.Module):
         
         # Note: out_channels of the internal gravnet layer
         # not clearly specified in paper
+        # self.gravnet_blocks = nn.ModuleList([
+        #     GravNetBlock(64 if i==0 else 96, k=k[i]) for i in range(self.n_gravnet_blocks)
+        #     ])
         self.gravnet_blocks = nn.ModuleList([
-            GravNetBlock(64 if i==0 else 96, k=k[i]) for i in range(self.n_gravnet_blocks)
-            ])
+        GravNetBlock(
+        64 if i==0 else 96,
+        k=k[i],
+        use_checkpoint=use_checkpoint
+        ) for i in range(self.n_gravnet_blocks)
+        ]) #gradient checkpoint effort
 
         # Post-GravNet dense layers
         postgn_dense_modules = nn.ModuleList()
@@ -193,15 +210,73 @@ class NoiseFilterModel(nn.Module):
 
 class GravnetModelWithNoiseFilter(nn.Module):
 
+    # def __init__(self, *args, **kwargs):
+    #     super(GravnetModelWithNoiseFilter, self).__init__()
+    #     self.signal_threshold = kwargs.pop('signal_threshold', .5)
+    #     self.gravnet = GravnetModel(*args, **kwargs)
+    #     self.noise_filter = NoiseFilterModel(input_dim=self.gravnet.input_dim)
+
+    # def forward(self, x: Tensor, batch: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    #     out_noise_filter = self.noise_filter(x)
+    #     pass_noise_filter = torch.exp(out_noise_filter[:,1]) > self.signal_threshold # Get the GravNet model output on only hits that pass the noise threshold
+        
+    #     out_gravnet = self.gravnet(x[pass_noise_filter], batch[pass_noise_filter])
+    #     return out_noise_filter, pass_noise_filter, out_gravnet
+    
+
     def __init__(self, *args, **kwargs):
         super(GravnetModelWithNoiseFilter, self).__init__()
-        self.signal_threshold = kwargs.pop('signal_threshold', .5)
+        self.signal_threshold = kwargs.pop("signal_threshold", 0.5)
+        self.max_passed_hits_per_event = kwargs.pop("max_passed_hits_per_event", None)
+        self.min_passed_hits_per_event = kwargs.pop("min_passed_hits_per_event", 1)
+
         self.gravnet = GravnetModel(*args, **kwargs)
         self.noise_filter = NoiseFilterModel(input_dim=self.gravnet.input_dim)
 
+    def _cap_hits_per_event(self, base_mask: Tensor, score: Tensor, batch: Tensor) -> Tensor:
+        keep = torch.zeros_like(base_mask, dtype=torch.bool)
+
+        unique_events = torch.unique(batch)
+        for ev in unique_events:
+            ev_mask = (batch == ev)
+
+            # candidates that passed threshold
+            cand_idx = torch.nonzero(ev_mask & base_mask, as_tuple=False).view(-1)
+
+            if cand_idx.numel() == 0:
+                # optional fallback: keep a few best hits even if threshold rejected all
+                if self.min_passed_hits_per_event > 0:
+                    ev_idx = torch.nonzero(ev_mask, as_tuple=False).view(-1)
+                    if ev_idx.numel() > 0:
+                        k_fb = min(self.min_passed_hits_per_event, ev_idx.numel())
+                        _, ord_fb = torch.topk(score[ev_idx], k=k_fb, largest=True, sorted=False)
+                        keep[ev_idx[ord_fb]] = True
+                continue
+
+            if self.max_passed_hits_per_event is None:
+                keep[cand_idx] = True
+                continue
+
+            k = min(self.max_passed_hits_per_event, cand_idx.numel())
+            _, ord_k = torch.topk(score[cand_idx], k=k, largest=True, sorted=False)
+            keep[cand_idx[ord_k]] = True
+
+        return keep
+
     def forward(self, x: Tensor, batch: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         out_noise_filter = self.noise_filter(x)
-        pass_noise_filter = torch.exp(out_noise_filter[:,1]) > self.signal_threshold
-        # Get the GravNet model output on only hits that pass the noise threshold
-        out_gravnet = self.gravnet(x[pass_noise_filter], batch[pass_noise_filter])
+
+        score = out_noise_filter[:, 1]
+        base_mask = torch.exp(score) > self.signal_threshold
+
+        if self.max_passed_hits_per_event is None:
+            pass_noise_filter = base_mask
+        else:
+            pass_noise_filter = self._cap_hits_per_event(base_mask, score, batch)
+
+        if pass_noise_filter.any():
+            out_gravnet = self.gravnet(x[pass_noise_filter], batch[pass_noise_filter])
+        else:
+            out_gravnet = x.new_zeros((0, self.gravnet.output_dim))
+
         return out_noise_filter, pass_noise_filter, out_gravnet
